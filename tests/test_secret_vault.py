@@ -128,6 +128,13 @@ class StoreUnitTest(unittest.TestCase):
             self.assertTrue(vault.delete("GOOD_NAME_1"))
             self.assertFalse(vault.delete("GOOD_NAME_1"))
 
+    def test_corrupt_store_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.enc"
+            path.write_bytes(b"this is not a vault")
+            with self.assertRaises(core.StoreError):
+                core.VaultStore(path, use_keyring=False).load()
+
 
 class PolicyUnitTest(unittest.TestCase):
     def setUp(self):

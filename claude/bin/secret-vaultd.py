@@ -1571,7 +1571,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
-    daemon = SecretVaultDaemon(socket_path, store_path, tmp_root, use_keyring=use_keyring)
+    try:
+        daemon = SecretVaultDaemon(socket_path, store_path, tmp_root, use_keyring=use_keyring)
+    except StoreError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 5
 
     def _handle_signal(_signum, _frame):
         daemon.stop()
