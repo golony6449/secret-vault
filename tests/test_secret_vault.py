@@ -189,7 +189,14 @@ class PolicyUnitTest(unittest.TestCase):
         probe = self.make_probe("print('ok')\n")
         resolved = core.validate_command(sys.executable, [str(probe)], str(REPO))
         self.assertTrue(os.path.isabs(resolved))
-        allowed = core.validate_command(sys.executable, [str(BIN / "my-tool.py")], str(REPO))
+        # ~/.claude/bin 허용: 실제 홈 폴더 대신 가짜 bin 폴더를 끼우고,
+        # 레포 밖 작업 폴더에서 실행해 bin 경로 규칙만으로 허용되는지 본다.
+        tool = self.make_probe("print('tool')\n")
+        original = core._claude_bin_dir
+        core._claude_bin_dir = lambda: tool.parent
+        self.addCleanup(setattr, core, "_claude_bin_dir", original)
+        with tempfile.TemporaryDirectory() as outside:
+            allowed = core.validate_command(sys.executable, [str(tool)], outside)
         self.assertTrue(os.path.isabs(allowed))
 
     def test_script_outside_allowed_roots_is_denied(self):
