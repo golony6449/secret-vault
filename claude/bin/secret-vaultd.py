@@ -20,6 +20,9 @@
 0600 키 파일(master.key)로 저장소를 암호화한다. 이 경우 같은 사용자 권한의
 다른 프로세스가 키 파일을 읽을 수 있으므로, 1차 목표인 "평문 시크릿 파일 제거"와
 "시크릿 주입 경로 단일화"는 달성하지만 OS Keyring 수준의 격리는 아니다.
+헤드리스 서버는 `--key-backend tpm2`로 마스터 키를 host+TPM2에 봉인할 수 있다.
+디스크만 떼어 가서는 풀 수 없지만, TPM 초기화·메인보드 교체 시에는 저장소를
+복구할 수 없으므로 원본 시크릿을 따로 보관해야 한다.
 
 수동 구동 예:
     python ~/.claude/bin/secret-vaultd.py --foreground
@@ -67,6 +70,10 @@ SANITIZE_MAX_PATTERN = 8192
 DERIVED_PATTERN_MIN = 6
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,127}$")
 EXT_RE = re.compile(r"^\.[A-Za-z0-9]{1,16}$")
+KEY_BACKENDS = ("auto", "tpm2")
+# TPM2 봉인 마스터 키 파일 이름과 systemd-creds 자격증명 이름(복호화 때 같아야 한다).
+TPM2_CRED_FILE = "vault-key.cred"
+TPM2_CRED_NAME = "secret-vault-master-key"
 # Windows에서 os.open은 기본이 텍스트 모드라 \n이 \r\n으로 바뀐다. 키/시크릿
 # 바이너리를 그대로 쓰려면 O_BINARY가 필요하다.
 _BINARY_FLAG = getattr(os, "O_BINARY", 0)
@@ -298,12 +305,29 @@ def _open_envelope(key: bytes, envelope: dict) -> bytes:
 
 
 class KeyProvider:
-    """마스터 키를 OS Keyring 또는 0600 키 파일에서 가져온다."""
+    """마스터 키를 OS Keyring 또는 0600 키 파일에서 가져온다.
 
-    def __init__(self, state_dir: Path, *, use_keyring: bool):
+    key_backend="tpm2"면 마스터 키를 `systemd-creds --user`로 host+TPM2에 봉인한
+    파일(vault-key.cred)에서만 꺼낸다. 이 경우 풀지 못하면 키 파일로 물러서지 않고
+    실패한다(새 키를 만들면 기존 저장소를 영영 못 열게 된다).
+    """
+
+    def __init__(
+        self,
+        state_dir: Path,
+        *,
+        use_keyring: bool,
+        key_backend: str = "auto",
+        store_path: Path | None = None,
+    ):
+        if key_backend not in KEY_BACKENDS:
+            raise StoreError(f"알 수 없는 마스터 키 방식이다: {key_backend}")
         self.state_dir = Path(state_dir)
         self.key_file = self.state_dir / "master.key"
+        self.cred_file = self.state_dir / TPM2_CRED_FILE
         self.use_keyring = use_keyring
+        self.key_backend = key_backend
+        self.store_path = Path(store_path) if store_path is not None else None
         self._cached: bytes | None = None
         self._lock = threading.Lock()
 
@@ -311,21 +335,116 @@ class KeyProvider:
         with self._lock:
             if self._cached is not None:
                 return self._cached
-            key = None
-            if self.use_keyring:
-                key = self._from_keyring()
-            if key is None:
-                key = self._from_file()
+            if self.key_backend == "tpm2":
+                key = self._from_tpm2()
+            else:
+                key = None
+                if self.use_keyring:
+                    key = self._from_keyring()
+                if key is None:
+                    key = self._from_file()
             self._cached = key
             return key
 
-    def _from_keyring(self) -> bytes | None:
+    def _run_creds(self, args: list[str], data: bytes) -> bytes:
+        exe = shutil.which("systemd-creds")
+        if exe is None:
+            raise StoreError("systemd-creds를 찾지 못해 TPM2 마스터 키를 쓸 수 없다")
+        try:
+            proc = subprocess.run(
+                [exe, "--user", *args],
+                input=data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise StoreError(f"systemd-creds 실행에 실패했다 ({type(exc).__name__})") from None
+        if proc.returncode != 0:
+            raise StoreError(f"systemd-creds가 실패했다 (종료 코드 {proc.returncode})")
+        return proc.stdout
+
+    def _seal_tpm2(self, key: bytes) -> bytes:
+        return self._run_creds(
+            ["encrypt", "--with-key=host+tpm2", f"--name={TPM2_CRED_NAME}", "-", "-"], key
+        )
+
+    def _unseal_tpm2(self, blob: bytes) -> bytes:
+        key = self._run_creds(["decrypt", f"--name={TPM2_CRED_NAME}", "-", "-"], blob)
+        if len(key) < 32:
+            raise StoreError("TPM2로 푼 마스터 키 길이가 올바르지 않다")
+        return key
+
+    def _from_tpm2(self) -> bytes:
+        _mkdir_private(self.state_dir)
+        try:
+            blob = self.cred_file.read_bytes()
+        except FileNotFoundError:
+            blob = None
+        except OSError as exc:
+            raise StoreError(f"TPM2 마스터 키 파일을 읽지 못했다 ({type(exc).__name__})") from None
+        if blob:
+            return self._unseal_tpm2(blob)
+        # 처음 TPM2로 바꿀 때: 기존 키가 있으면 옮기고, 없을 때만 새로 만든다.
+        migrated_from = None
+        key = None
+        if self.use_keyring:
+            key = self._from_keyring(create=False)
+            if key is not None:
+                migrated_from = "keyring"
+        if key is None:
+            key = self._read_key_file()
+            if key is not None:
+                migrated_from = "file"
+        if key is None:
+            if self.store_path is not None and self.store_path.exists():
+                raise StoreError("저장소는 있는데 마스터 키를 찾지 못했다. 새 키를 만들지 않는다")
+            key = os.urandom(32)
+        sealed = self._seal_tpm2(key)
+        if self._unseal_tpm2(sealed) != key:
+            raise StoreError("TPM2 봉인 확인에 실패했다")
+        try:
+            _atomic_write(self.cred_file, sealed)
+        except OSError as exc:
+            raise StoreError(f"TPM2 마스터 키 파일을 쓰지 못했다 ({type(exc).__name__})") from None
+        # 봉인을 확인한 뒤에만 이전 위치의 키를 지운다.
+        if migrated_from == "file":
+            try:
+                self.key_file.unlink()
+            except OSError as exc:
+                LOG.warning("이전 마스터 키 파일을 지우지 못했다 (%s)", type(exc).__name__)
+        elif migrated_from == "keyring":
+            try:
+                import keyring  # type: ignore
+
+                keyring.delete_password(APP_NAME, "master-key")
+            except Exception as exc:
+                LOG.warning("OS Keyring의 이전 마스터 키를 지우지 못했다 (%s)", type(exc).__name__)
+        if migrated_from:
+            LOG.info("마스터 키를 TPM2 봉인으로 옮겼다 (이전 위치: %s)", migrated_from)
+        return key
+
+    def _read_key_file(self) -> bytes | None:
+        try:
+            data = self.key_file.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise StoreError(f"마스터 키 파일을 읽지 못했다 ({type(exc).__name__})") from None
+        if len(data) < 32:
+            raise StoreError("마스터 키 파일이 올바르지 않다")
+        return data
+
+    def _from_keyring(self, *, create: bool = True) -> bytes | None:
         try:
             import keyring  # type: ignore
 
             stored = keyring.get_password(APP_NAME, "master-key")
             if stored:
                 return _b64d(stored)
+            if not create:
+                return None
             generated = os.urandom(32)
             keyring.set_password(APP_NAME, "master-key", _b64e(generated))
             return generated
@@ -397,9 +516,11 @@ def _validate_entry(name: str, entry: Any) -> dict:
 class VaultStore:
     """암호화된 로컬 저장소 파일. 값은 메모리에만 복호화해 둔다."""
 
-    def __init__(self, path: Path, *, use_keyring: bool = False):
+    def __init__(self, path: Path, *, use_keyring: bool = False, key_backend: str = "auto"):
         self.path = Path(path)
-        self._keys = KeyProvider(self.path.parent, use_keyring=use_keyring)
+        self._keys = KeyProvider(
+            self.path.parent, use_keyring=use_keyring, key_backend=key_backend, store_path=self.path
+        )
         self._lock = threading.RLock()
         self._data: dict[str, dict] | None = None
 
@@ -1174,10 +1295,13 @@ class SecretVaultDaemon:
         tmp_root: Path,
         *,
         use_keyring: bool,
+        key_backend: str = "auto",
     ):
         self.socket_path = Path(socket_path)
         self.tmp_root = Path(tmp_root)
-        self.vault = SecretVault(VaultStore(Path(store_path), use_keyring=use_keyring))
+        self.vault = SecretVault(
+            VaultStore(Path(store_path), use_keyring=use_keyring, key_backend=key_backend)
+        )
         self._stop = threading.Event()
         self._server: socket.socket | None = None
         self._bound = False
@@ -1543,6 +1667,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--socket", default=str(default_socket_path()), help="Unix 도메인 소켓 경로")
     parser.add_argument("--store", default=None, help="암호화 저장소 파일 경로 (기본: ~/.claude/state/secret-vault/vault.enc)")
     parser.add_argument("--tmp-dir", default=None, help="파일형 시크릿 임시 생성 폴더 (기본: /dev/shm/secret-vault 또는 %%TEMP%%/secret-vault)")
+    parser.add_argument(
+        "--key-backend",
+        choices=KEY_BACKENDS,
+        default="auto",
+        help="마스터 키 보관 방식. auto: OS Keyring, 안 되면 0600 키 파일. tpm2: systemd-creds로 host+TPM2에 봉인 (무인 재부팅용)",
+    )
     parser.add_argument("--foreground", action="store_true", help="포그라운드에서 실행하고 로그를 콘솔로 낸다")
     parser.add_argument("--stop", action="store_true", help="실행 중인 데몬을 종료한다")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -1563,6 +1693,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             forward += ["--store", str(store_path)]
         if args.tmp_dir:
             forward += ["--tmp-dir", str(tmp_root)]
+        if args.key_backend != "auto":
+            forward += ["--key-backend", args.key_backend]
         pid = _spawn_background(forward, default_state_dir() / "daemon.log")
         print(f"[OK] 시크릿 볼트 데몬을 백그라운드로 시작했다. pid={pid} socket={socket_path}")
         return 0
@@ -1572,7 +1704,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         stream=sys.stderr,
     )
     try:
-        daemon = SecretVaultDaemon(socket_path, store_path, tmp_root, use_keyring=use_keyring)
+        daemon = SecretVaultDaemon(
+            socket_path, store_path, tmp_root, use_keyring=use_keyring, key_backend=args.key_backend
+        )
     except StoreError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 5

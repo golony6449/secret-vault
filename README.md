@@ -122,6 +122,19 @@ python claude/bin/secret-vaultd.py --socket /path/to/custom.sock --foreground
 python claude/bin/secret-vaultd.py --stop
 ```
 
+#### 헤드리스 서버: TPM2 마스터 키 (`--key-backend tpm2`)
+
+화면 없는 서버는 잠금 해제할 OS Keyring이 없어 기본값으로는 0600 키 파일(`master.key`)을 씁니다. `--key-backend tpm2`를 주면 마스터 키를 `systemd-creds --user`로 host+TPM2에 봉인한 `vault-key.cred`에 보관하므로, 사람 없이 재부팅해도 데몬이 저장소를 열 수 있고 디스크만 떼어 가서는 풀 수 없습니다.
+
+```bash
+python claude/bin/secret-vaultd.py --key-backend tpm2 --foreground
+```
+
+- 필요 조건: `systemd-analyze has-tpm2`가 `yes`여야 합니다. `partial`이고 `libtss2-rc.so.0`이 없다고 나오면 `sudo apt install libtss2-rc0t64`로 설치합니다.
+- 처음 켤 때 기존 `master.key`나 Keyring 키가 있으면 TPM2로 옮겨 봉인을 확인한 뒤 이전 키를 지웁니다.
+- 봉인을 풀지 못하면 키 파일로 물러서지 않고 기동을 멈춥니다. 저장소는 있는데 키가 없으면 새 키를 만들지 않습니다.
+- **복구 주의**: TPM 초기화, 메인보드 교체, OS 재설치 뒤에는 저장소를 영영 열 수 없습니다. 원본 시크릿은 따로 보관해 다시 등록할 수 있게 해 둡니다.
+
 ### 5.2 시크릿 관리 CLI (`secret-vault`)
 
 사용자(인간 개발자)가 터미널에서 직접 키를 안전하게 등록·조회·삭제합니다. 실제 시크릿 값은 터미널 화면에 절대 노출되지 않습니다.
@@ -239,6 +252,7 @@ python -B -m unittest tests.test_secret_vault.PolicyUnitTest -v
 - RCE 차단(`python -c`, `bash -c`, 임시 스크립트, `env` 래퍼 우회 등) 검증
 - 스트림 실시간 출력 마스킹(청크 경계 분할 및 Base64 파생형 포함) 검증
 - 시스템 서비스(systemd) 미등록 원칙 검증
+- TPM2 마스터 키: 봉인 파일 0600, 기존 키 이전 후 삭제, 봉인 해제 실패 시 키 파일로 물러서지 않음, 키 없는 기존 저장소 재생성 거부
 
 ---
 
