@@ -19,6 +19,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 BIN = REPO / "claude" / "bin"
@@ -134,6 +135,97 @@ class StoreUnitTest(unittest.TestCase):
             path.write_bytes(b"this is not a vault")
             with self.assertRaises(core.StoreError):
                 core.VaultStore(path, use_keyring=False).load()
+
+
+class FakeCreds:
+    """systemd-creds 대역. 봉인 결과에 평문 키가 보이지 않게 뒤집고 표식을 붙인다."""
+
+    PREFIX = b"FAKE-TPM2-SEALED:"
+
+    def __init__(self, *, fail_decrypt: bool = False):
+        self.fail_decrypt = fail_decrypt
+        self.calls: list[list[str]] = []
+
+    def __call__(self, provider, args, data):
+        self.calls.append(list(args))
+        if f"--name={core.TPM2_CRED_NAME}" not in args:
+            raise core.StoreError("자격증명 이름이 빠졌다")
+        if args[0] == "encrypt":
+            if "--with-key=host+tpm2" not in args:
+                raise core.StoreError("host+tpm2 봉인이 아니다")
+            return self.PREFIX + bytes(b ^ 0xFF for b in data)
+        if args[0] == "decrypt":
+            if self.fail_decrypt or not data.startswith(self.PREFIX):
+                raise core.StoreError("systemd-creds가 실패했다 (종료 코드 1)")
+            return bytes(b ^ 0xFF for b in data[len(self.PREFIX):])
+        raise AssertionError(args)
+
+
+class Tpm2KeyBackendTest(unittest.TestCase):
+    def _patch(self, fake):
+        patcher = mock.patch.object(core.KeyProvider, "_run_creds", autospec=True, side_effect=fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_new_vault_seals_key_and_writes_no_key_file(self):
+        fake = FakeCreds()
+        self._patch(fake)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.enc"
+            vault = core.SecretVault(core.VaultStore(path, key_backend="tpm2"))
+            vault.set_string("FAKE_TOKEN", "fake-tpm2-value-123")
+            cred = Path(tmp) / core.TPM2_CRED_FILE
+            self.assertTrue(cred.exists())
+            self.assertFalse((Path(tmp) / "master.key").exists())
+            if os.name == "posix":
+                self.assertEqual(cred.stat().st_mode & 0o777, 0o600)
+            reopened = core.SecretVault(core.VaultStore(path, key_backend="tpm2"))
+            self.assertEqual(reopened.snapshot()["FAKE_TOKEN"]["value"], "fake-tpm2-value-123")
+            self.assertIn(["decrypt", f"--name={core.TPM2_CRED_NAME}", "-", "-"], fake.calls)
+
+    def test_existing_key_file_is_migrated_then_removed(self):
+        self._patch(FakeCreds())
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.enc"
+            core.SecretVault(core.VaultStore(path)).set_string("FAKE_OLD", "fake-old-value")
+            self.assertTrue((Path(tmp) / "master.key").exists())
+            migrated = core.SecretVault(core.VaultStore(path, key_backend="tpm2"))
+            self.assertEqual(migrated.snapshot()["FAKE_OLD"]["value"], "fake-old-value")
+            self.assertFalse((Path(tmp) / "master.key").exists())
+            self.assertTrue((Path(tmp) / core.TPM2_CRED_FILE).exists())
+
+    def test_unseal_failure_does_not_fall_back_to_key_file(self):
+        self._patch(FakeCreds(fail_decrypt=True))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.enc"
+            (Path(tmp) / core.TPM2_CRED_FILE).write_bytes(FakeCreds.PREFIX + b"\x00" * 32)
+            path.write_text("{}", encoding="utf-8")
+            with self.assertRaises(core.StoreError):
+                core.VaultStore(path, key_backend="tpm2").load()
+            self.assertFalse((Path(tmp) / "master.key").exists())
+
+    def test_existing_store_without_any_key_is_not_rekeyed(self):
+        fake = FakeCreds()
+        self._patch(fake)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.enc"
+            path.write_text('{"v": 1}', encoding="utf-8")
+            with self.assertRaises(core.StoreError):
+                core.VaultStore(path, key_backend="tpm2").load()
+            self.assertFalse((Path(tmp) / core.TPM2_CRED_FILE).exists())
+            self.assertEqual(fake.calls, [])
+
+    def test_missing_systemd_creds_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(core.shutil, "which", return_value=None):
+            with self.assertRaises(core.StoreError):
+                core.SecretVault(core.VaultStore(Path(tmp) / "vault.enc", key_backend="tpm2")).set_string(
+                    "FAKE_B", "fake-b"
+                )
+
+    def test_unknown_backend_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(core.StoreError):
+                core.VaultStore(Path(tmp) / "vault.enc", key_backend="plain")
 
 
 class PolicyUnitTest(unittest.TestCase):
