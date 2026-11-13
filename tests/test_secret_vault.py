@@ -709,5 +709,125 @@ class ServiceInstallerTest(unittest.TestCase):
             self.assertTrue(all("--user" in c for c in commands if c[0] == "systemctl"))
 
 
+TOOLS = REPO / "tools.py"
+
+
+def load_tools():
+    spec = importlib.util.spec_from_file_location("secret_vault_tools_under_test", TOOLS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+tools = load_tools()
+
+
+class FakeClient:
+    def __init__(self, names=()):
+        self.data = {name: "fake-old-value" for name in names}
+        self.calls: list[tuple] = []
+
+    def list(self):
+        return [{"name": name, "type": "string"} for name in sorted(self.data)]
+
+    def set_string(self, name, value):
+        self.calls.append(("set", name))
+        self.data[name] = value
+
+    def set_file(self, name, content, extension):
+        self.calls.append(("set-file", name, extension))
+        self.data[name] = content
+
+    def delete(self, name):
+        self.calls.append(("delete", name))
+        return self.data.pop(name, None) is not None
+
+
+class FakePrompter:
+    def __init__(self, texts=(), secrets=(), confirms=()):
+        self.texts = list(texts)
+        self.secrets = list(secrets)
+        self.confirms = list(confirms)
+        self.confirm_prompts: list[str] = []
+
+    def ask_text(self, prompt):
+        return self.texts.pop(0)
+
+    def ask_secret(self, prompt):
+        return self.secrets.pop(0)
+
+    def confirm(self, prompt):
+        self.confirm_prompts.append(prompt)
+        return self.confirms.pop(0)
+
+
+class ToolsTuiFlowTest(unittest.TestCase):
+    def test_new_key_registers_without_overwrite_prompt(self):
+        client = FakeClient()
+        ui = FakePrompter(texts=["FAKE_NEW"], secrets=["fake-new-value"])
+        message = tools.register(client, ui, kind="string")
+        self.assertEqual(client.data["FAKE_NEW"], "fake-new-value")
+        self.assertEqual(ui.confirm_prompts, [])
+        self.assertIn("등록했습니다", message)
+        self.assertNotIn("fake-new-value", message)
+
+    def test_existing_key_asks_then_overwrites(self):
+        client = FakeClient(["FAKE_DUP"])
+        ui = FakePrompter(texts=["FAKE_DUP"], secrets=["fake-replaced"], confirms=[True])
+        message = tools.register(client, ui, kind="string")
+        self.assertEqual(client.data["FAKE_DUP"], "fake-replaced")
+        self.assertEqual(len(ui.confirm_prompts), 1)
+        self.assertIn("이미 등록된 키 입니다. 덮어 쓰시겠습니까?", ui.confirm_prompts[0])
+        self.assertIn("덮어썼습니다", message)
+        self.assertNotIn("fake-replaced", message)
+
+    def test_existing_key_declined_keeps_old_value_and_asks_no_value(self):
+        client = FakeClient(["FAKE_DUP"])
+        ui = FakePrompter(texts=["FAKE_DUP"], confirms=[False])
+        tools.register(client, ui, kind="string")
+        self.assertEqual(client.data["FAKE_DUP"], "fake-old-value")
+        self.assertEqual(client.calls, [])
+
+    def test_cancel_and_empty_value_do_not_register(self):
+        client = FakeClient()
+        tools.register(client, FakePrompter(texts=[None]), kind="string")
+        tools.register(client, FakePrompter(texts=["FAKE_X"], secrets=[None]), kind="string")
+        tools.register(client, FakePrompter(texts=["FAKE_X"], secrets=[""]), kind="string")
+        self.assertEqual(client.calls, [])
+
+    def test_file_register_overwrite_asks_first(self):
+        client = FakeClient(["FAKE_FILE"])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "fake.json"
+            src.write_bytes(b'{"fake": true}')
+            ui = FakePrompter(texts=["FAKE_FILE", str(src)], confirms=[True])
+            tools.register(client, ui, kind="file")
+        self.assertEqual(client.calls, [("set-file", "FAKE_FILE", ".json")])
+        self.assertEqual(len(ui.confirm_prompts), 1)
+
+    def test_remove_requires_confirmation(self):
+        client = FakeClient(["FAKE_DEL"])
+        tools.remove(client, FakePrompter(confirms=[False]), "FAKE_DEL")
+        self.assertIn("FAKE_DEL", client.data)
+        message = tools.remove(client, FakePrompter(confirms=[True]), "FAKE_DEL")
+        self.assertNotIn("FAKE_DEL", client.data)
+        self.assertIn("제거했습니다", message)
+
+
+class ToolsClientDaemonTest(DaemonCase):
+    def test_client_roundtrip_against_real_daemon(self):
+        client = tools.VaultClient(self.socket_path)
+        ui = FakePrompter(texts=["FAKE_TUI"], secrets=["fake-tui-value-1"])
+        tools.register(client, ui, kind="string")
+        ui = FakePrompter(texts=["FAKE_TUI"], secrets=["fake-tui-value-2"], confirms=[True])
+        self.assertIn("덮어썼습니다", tools.register(client, ui, kind="string"))
+        self.assertEqual([row["name"] for row in client.list()], ["FAKE_TUI"])
+        self.assertNotIn("fake-tui-value", json.dumps(client.list()))
+        tools.remove(client, FakePrompter(confirms=[True]), "FAKE_TUI")
+        self.assertEqual(client.list(), [])
+        with self.assertRaises(tools.VaultError):
+            client.set_string("bad name", "fake")
+
+
 if __name__ == "__main__":
     unittest.main()

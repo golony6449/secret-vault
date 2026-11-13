@@ -108,6 +108,7 @@ secret-vault/
 │   ├── secret-vault.py        # 관리자 CLI (list, set, set-file, delete, status)
 │   ├── secret-run.py          # 격리 실행 러너 (RCE 검증 중계, 마스킹 스트림 출력)
 │   └── secret-vault-service.py # 자동 기동용 systemd 사용자 유닛 등록/해제 (사용자가 직접 실행)
+├── tools.py                   # 시크릿 등록·제거 TUI (사용자가 직접 실행, 값 미표시)
 ├── tests/
 │   └── test_secret_vault.py   # 코어 단위 및 통합 테스트 슈트 (34개 이상 시나리오)
 ├── docs/
