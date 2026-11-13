@@ -28,7 +28,8 @@
     python ~/.claude/bin/secret-vaultd.py --foreground
     python ~/.claude/bin/secret-vaultd.py --socket /tmp/sv.sock --stop
 
-시스템 서비스(systemd 등) 등록은 하지 않는다. 테스트와 수동 구동만 지원한다.
+데몬은 스스로 시스템 서비스를 등록하지 않는다. 재부팅 뒤 자동 기동이 필요하면 사용자가
+secret-vault-service.py install로 systemd 사용자 유닛을 직접 등록한다.
 """
 
 from __future__ import annotations
@@ -1662,7 +1663,7 @@ def _spawn_background(argv: list[str], log_path: Path) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="로컬 시크릿 볼트 데몬 (수동/테스트 구동 전용, 시스템 서비스 등록 없음)",
+        description="로컬 시크릿 볼트 데몬 (스스로 서비스 등록 안 함, 자동 기동은 secret-vault-service.py)",
     )
     parser.add_argument("--socket", default=str(default_socket_path()), help="Unix 도메인 소켓 경로")
     parser.add_argument("--store", default=None, help="암호화 저장소 파일 경로 (기본: ~/.claude/state/secret-vault/vault.enc)")

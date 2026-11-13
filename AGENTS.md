@@ -75,10 +75,12 @@
 
 ---
 
-## 6. 시스템 서비스(systemd 등) 미등록 원칙
+## 6. 시스템 서비스 등록 원칙 (사용자 유닛만, 사용자 실행으로만)
 
-- 데몬(`secret-vaultd.py`)은 **시스템 서비스(systemd 유닛, Windows 서비스)로 자동 등록하지 않습니다.**
-- 테스트 하네스에서 임시 소켓/디렉토리로 직접 서브프로세스를 띄우거나, 사용자가 수동 포그라운드/백그라운드로 구동하는 경로만 유지합니다.
+- 데몬(`secret-vaultd.py`)은 **스스로 시스템 서비스(systemd 유닛, Windows 서비스)를 등록하지 않습니다.** 데몬 코드에 `systemctl` 등 등록 명령을 넣지 않습니다.
+- 재부팅 뒤 자동 기동은 **systemd 사용자 유닛만** 씁니다. 사용자가 `python claude/bin/secret-vault-service.py install`을 직접 실행할 때만 등록하며(유닛 + `loginctl enable-linger`), root가 필요한 시스템 유닛·Windows 서비스는 쓰지 않습니다.
+- 에이전트는 사용자가 시키지 않는 한 설치 스크립트(`install`/`uninstall`)를 실행하지 않습니다. 확인이 필요하면 `--dry-run`만 씁니다.
+- 테스트는 실제 유닛을 등록하지 않고, 임시 소켓/디렉토리로 데몬을 직접 띄우거나 등록 명령을 대역으로 바꿔 검증합니다.
 
 ---
 
@@ -104,7 +106,8 @@ secret-vault/
 ├── claude/bin/
 │   ├── secret-vaultd.py       # 볼트 데몬 코어 (소켓 서버, Keyring 연동, 프로세스 실행, Sanitizer)
 │   ├── secret-vault.py        # 관리자 CLI (list, set, set-file, delete, status)
-│   └── secret-run.py          # 격리 실행 러너 (RCE 검증 중계, 마스킹 스트림 출력)
+│   ├── secret-run.py          # 격리 실행 러너 (RCE 검증 중계, 마스킹 스트림 출력)
+│   └── secret-vault-service.py # 자동 기동용 systemd 사용자 유닛 등록/해제 (사용자가 직접 실행)
 ├── tests/
 │   └── test_secret_vault.py   # 코어 단위 및 통합 테스트 슈트 (34개 이상 시나리오)
 ├── docs/

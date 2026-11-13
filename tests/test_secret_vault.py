@@ -1,8 +1,8 @@
 # secret-vault 시험. 실행: python -B -m unittest tests.test_secret_vault -v
 """시크릿 볼트 코어 단위/통합 시험.
 
-시스템 서비스(systemd 등)는 등록하지 않는다. 데몬을 테스트 하네스가 직접
-서브프로세스로 띄워 수동 구동 경로만 검증한다.
+실제 시스템 서비스(systemd 등)는 등록하지 않는다. 데몬은 테스트 하네스가 직접
+서브프로세스로 띄우고, 설치 스크립트는 등록 명령을 대역으로 바꿔 검증한다.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ BIN = REPO / "claude" / "bin"
 DAEMON = BIN / "secret-vaultd.py"
 ADMIN = BIN / "secret-vault.py"
 RUNNER = BIN / "secret-run.py"
+SERVICE = BIN / "secret-vault-service.py"
 PROBE_ROOT = REPO / ".ds-tmp" / "secret-vault-tests"
 
 
@@ -647,8 +648,65 @@ class DaemonLifecycleTest(DaemonCase):
 
     def test_daemon_does_not_register_system_services(self):
         source = DAEMON.read_text(encoding="utf-8")
-        for marker in ("systemctl", "systemd-analyze", "sc create", "New-Service"):
+        for marker in ("systemctl", "systemd-analyze", "loginctl", "sc create", "New-Service"):
             self.assertNotIn(marker, source)
+
+
+def load_service():
+    spec = importlib.util.spec_from_file_location("secret_vault_service_under_test", SERVICE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ServiceInstallerTest(unittest.TestCase):
+    def setUp(self):
+        self.svc = load_service()
+
+    def test_unit_runs_daemon_in_foreground_with_tpm2_and_private_umask(self):
+        unit = self.svc.render_unit("/usr/bin/python3", Path("/opt/sv/secret-vaultd.py"), "tpm2")
+        self.assertIn(
+            "ExecStart=/usr/bin/python3 -B /opt/sv/secret-vaultd.py --foreground --key-backend tpm2\n", unit
+        )
+        self.assertIn("Restart=on-failure\n", unit)
+        self.assertIn("UMask=0077\n", unit)
+        self.assertIn("WantedBy=default.target\n", unit)
+        with self.assertRaises(ValueError):
+            self.svc.render_unit("/usr/bin/python3", Path("/opt/sv/secret-vaultd.py"), "plain")
+
+    def test_install_defaults_to_tpm2_and_sibling_daemon(self):
+        args = self.svc.build_parser().parse_args(["install"])
+        self.assertEqual(args.key_backend, "tpm2")
+        self.assertEqual(self.svc.default_daemon_path(), DAEMON.resolve())
+
+    def test_dry_run_changes_nothing(self):
+        if not sys.platform.startswith("linux"):
+            self.skipTest("사용자 유닛 등록은 리눅스 전용")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": tmp}
+        ), mock.patch.object(self.svc.subprocess, "run") as run, mock.patch("builtins.print"):
+            code = self.svc.main(["install", "--dry-run"])
+            self.assertEqual(code, 0)
+            run.assert_not_called()
+            self.assertFalse((Path(tmp) / "systemd").exists())
+
+    def test_install_writes_user_unit_and_enables_linger(self):
+        if not sys.platform.startswith("linux"):
+            self.skipTest("사용자 유닛 등록은 리눅스 전용")
+        ok = subprocess.CompletedProcess([], 0)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": tmp}
+        ), mock.patch.object(self.svc.subprocess, "run", return_value=ok) as run, mock.patch("builtins.print"):
+            code = self.svc.main(["install", "--python", "/usr/bin/python3"])
+            self.assertEqual(code, 0)
+            unit = Path(tmp) / "systemd" / "user" / self.svc.UNIT_NAME
+            self.assertIn("--key-backend tpm2", unit.read_text(encoding="utf-8"))
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(commands[0], ["systemctl", "--user", "daemon-reload"])
+            self.assertEqual(commands[1], ["systemctl", "--user", "enable", "--now", self.svc.UNIT_NAME])
+            self.assertEqual(commands[2][:2], ["loginctl", "enable-linger"])
+            # 시스템 유닛(root)은 쓰지 않는다.
+            self.assertTrue(all("--user" in c for c in commands if c[0] == "systemctl"))
 
 
 if __name__ == "__main__":
