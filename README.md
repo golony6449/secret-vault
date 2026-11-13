@@ -98,6 +98,7 @@
 | `claude/bin/secret-vaultd.py` | **볼트 데몬 (Daemon)** | IPC 소켓 서버, OS Keyring 연동, 시크릿 메모리 보관, 프로세스 격리 실행, 스트림 마스킹 |
 | `claude/bin/secret-vault.py` | **관리자 CLI (Admin)** | 대화형 키 등록/조회/삭제 도구 (`list`, `set`, `set-file`, `delete`, `status`). 값은 절대 미출력 |
 | `claude/bin/secret-run.py` | **격리 실행 러너 (Runner)** | `secret-run <명령어...>` 형태로 안전 실행. 데몬 중계 및 마스킹 스트림 출력, 종료 코드 동기화 |
+| `claude/bin/secret-vault-service.py` | **자동 기동 설치 (Service)** | systemd 사용자 유닛 + linger 등록/해제. 사용자가 직접 실행할 때만 등록 |
 | `tests/test_secret_vault.py` | **통합 테스트 슈트** | 데몬, CLI, 러너, RCE 차단, 마스킹, 생명주기 등 34개 이상의 단위 및 통합 테스트 시나리오 |
 
 ---
@@ -106,7 +107,7 @@
 
 ### 5.1 데몬 구동 (`secret-vaultd`)
 
-데몬은 시스템 서비스(systemd)로 상시 등록하지 않고, 수동 구동 또는 테스트 하네스에서 직접 실행합니다.
+데몬은 스스로 시스템 서비스를 등록하지 않습니다. 평소에는 수동으로 구동하고, 재부팅 뒤 자동 기동이 필요하면 아래 [자동 기동](#자동-기동-systemd-사용자-유닛)처럼 사용자가 직접 사용자 유닛을 등록합니다.
 
 ```bash
 # 1. 포그라운드 실행 (로그 및 디버깅 콘솔)
@@ -134,6 +135,25 @@ python claude/bin/secret-vaultd.py --key-backend tpm2 --foreground
 - 처음 켤 때 기존 `master.key`나 Keyring 키가 있으면 TPM2로 옮겨 봉인을 확인한 뒤 이전 키를 지웁니다.
 - 봉인을 풀지 못하면 키 파일로 물러서지 않고 기동을 멈춥니다. 저장소는 있는데 키가 없으면 새 키를 만들지 않습니다.
 - **복구 주의**: TPM 초기화, 메인보드 교체, OS 재설치 뒤에는 저장소를 영영 열 수 없습니다. 원본 시크릿은 따로 보관해 다시 등록할 수 있게 해 둡니다.
+
+#### 자동 기동 (systemd 사용자 유닛)
+
+재부팅 뒤 로그인하지 않아도 데몬이 뜨게 하려면 설치 스크립트를 직접 실행합니다. root가 필요 없는 사용자 유닛(`~/.config/systemd/user/secret-vaultd.service`)을 만들고 `loginctl enable-linger`를 켭니다. 마스터 키 방식은 기본이 `tpm2`입니다.
+
+```bash
+# 바꾸지 않고 유닛 내용과 실행할 명령만 보기
+python claude/bin/secret-vault-service.py install --dry-run
+
+# 등록하고 바로 시작 (기존 master.key가 있으면 이때 TPM2로 옮겨진다)
+python claude/bin/secret-vault-service.py install
+
+# 상태 확인 / 해제
+python claude/bin/secret-vault-service.py status
+python claude/bin/secret-vault-service.py uninstall
+```
+
+- 유닛은 이 스크립트 옆의 `secret-vaultd.py`를 실행합니다. 다른 사본을 쓰려면 `--daemon <경로>`를 줍니다.
+- 비정상 종료 시 5초 뒤 다시 띄웁니다(`Restart=on-failure`). 로그는 `journalctl --user -u secret-vaultd`로 봅니다.
 
 ### 5.2 시크릿 관리 CLI (`secret-vault`)
 
@@ -251,7 +271,7 @@ python -B -m unittest tests.test_secret_vault.PolicyUnitTest -v
 - 파일형 시크릿 RAM 생성 및 종료 후 shred/unlink 영구 파기 검증
 - RCE 차단(`python -c`, `bash -c`, 임시 스크립트, `env` 래퍼 우회 등) 검증
 - 스트림 실시간 출력 마스킹(청크 경계 분할 및 Base64 파생형 포함) 검증
-- 시스템 서비스(systemd) 미등록 원칙 검증
+- 데몬 코드가 스스로 서비스를 등록하지 않음, 설치 스크립트의 유닛 내용과 `--dry-run` 무변경 검증
 - TPM2 마스터 키: 봉인 파일 0600, 기존 키 이전 후 삭제, 봉인 해제 실패 시 키 파일로 물러서지 않음, 키 없는 기존 저장소 재생성 거부
 
 ---
